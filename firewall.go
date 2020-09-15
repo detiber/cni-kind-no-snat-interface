@@ -121,7 +121,7 @@ func cmdDel(args *skel.CmdArgs) error {
 }
 
 func main() {
-	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.PluginSupports("0.4.0"), bv.BuildString("kind-no-snat-interface"))
+	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.PluginSupports("0.4.0", "0.3.1"), bv.BuildString("kind-no-snat-interface"))
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
