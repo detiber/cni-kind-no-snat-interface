@@ -36,8 +36,8 @@ func generateJumpRule(chainName string) []string {
 func getRules(interfaces []*current.Interface, route *types.Route) [][]string {
 	var rules [][]string
 	for _, iface := range interfaces {
-		rules = append(rules, []string{"-d", route.Dst.String(), "-i", iface.Name, "-j", "RETURN"})
-		rules = append(rules, []string{"-s", route.Dst.String(), "-o", iface.Name, "-j", "RETURN"})
+		rules = append(rules, []string{"-d", route.Dst.String(), "-i", iface.Name, "-j", "ACCEPT"})
+		rules = append(rules, []string{"-s", route.Dst.String(), "-o", iface.Name, "-j", "ACCEPT"})
 	}
 
 	return rules
