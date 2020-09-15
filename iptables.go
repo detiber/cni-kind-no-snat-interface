@@ -21,23 +21,55 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
+	"github.com/containernetworking/plugins/pkg/utils"
 	"github.com/coreos/go-iptables/iptables"
 )
 
-const kindPostRoutingChainName = "KIND-MASQ-AGENT"
+const noSNATPostRoutingChainName = "KIND-NO-SNAT"
 
-func generateFilterRule(privChainName string) []string {
-	return []string{"-m", "comment", "--comment", "CNI firewall plugin rules", "-j", privChainName}
+func generateJumpRule(chainName string) []string {
+	return []string{"-m", "comment", "--comment", "kind no SNAT plugin rules", "-j", chainName}
 }
 
-func generateAdminRule(adminChainName string) []string {
-	return []string{"-m", "comment", "--comment", "CNI firewall plugin admin overrides", "-j", adminChainName}
+func getRules(interfaces []*current.Interface, route *types.Route) [][]string {
+	var rules [][]string
+	for _, iface := range interfaces {
+		rules = append(rules, []string{"-d", route.Dst.String(), "-i", iface.Name, "-j", "RETURN"})
+		rules = append(rules, []string{"-s", route.Dst.String(), "-o", iface.Name, "-j", "RETURN"})
+	}
+
+	return rules
 }
 
-func cleanupRules(ipt *iptables.IPTables, privChainName string, rules [][]string) {
+func ensureFirstChainRule(ipt *iptables.IPTables, chain string, rule []string) error {
+	exists, err := ipt.Exists("nat", chain, rule...)
+	if !exists && err == nil {
+		err = ipt.Insert("nat", chain, 1, rule...)
+	}
+	return err
+}
+
+func (ib *iptablesBackend) setupChains(ipt *iptables.IPTables) error {
+	jumpRule := generateJumpRule(noSNATPostRoutingChainName)
+
+	// Ensure our private chain exist
+	if err := utils.EnsureChain(ipt, "nat", noSNATPostRoutingChainName); err != nil {
+		return err
+	}
+
+	// Ensure our jump rule exists in the POSTROUTING chain
+	if err := ensureFirstChainRule(ipt, "POSTROUTING", jumpRule); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func cleanupRules(ipt *iptables.IPTables, chainName string, rules [][]string) {
 	for _, rule := range rules {
-		ipt.Delete("nat", privChainName, rule...)
+		ipt.Delete("nat", chainName, rule...)
 	}
 }
 
@@ -49,11 +81,6 @@ func protoForIP(ip net.IPNet) iptables.Protocol {
 }
 
 func (ib *iptablesBackend) addRules(conf *FirewallNetConf, result *current.Result, ipt *iptables.IPTables, proto iptables.Protocol) error {
-	// TODO: Create chain
-	// TODO: insert postrouting rule for chain before kindPostRoutingChainName
-	// TODO: all rules for int/route combinations should be appended to our chain
-	// TODO: rules we create should have a target of "RETURN"
-
 	rules := make([][]string, 0)
 	for _, route := range result.Routes {
 		if protoForIP(route.Dst) == proto {
@@ -62,16 +89,20 @@ func (ib *iptablesBackend) addRules(conf *FirewallNetConf, result *current.Resul
 	}
 
 	if len(rules) > 0 {
+		if err := ib.setupChains(ipt); err != nil {
+			return err
+		}
+
 		// Clean up on any errors
 		var err error
 		defer func() {
 			if err != nil {
-				cleanupRules(ipt, kindPostRoutingChainName, rules)
+				cleanupRules(ipt, noSNATPostRoutingChainName, rules)
 			}
 		}()
 
 		for _, rule := range rules {
-			err = ipt.AppendUnique("nat", kindPostRoutingChainName, rule...)
+			err = ipt.AppendUnique("nat", noSNATPostRoutingChainName, rule...)
 			if err != nil {
 				return err
 			}
@@ -83,14 +114,14 @@ func (ib *iptablesBackend) addRules(conf *FirewallNetConf, result *current.Resul
 
 func (ib *iptablesBackend) delRules(conf *FirewallNetConf, result *current.Result, ipt *iptables.IPTables, proto iptables.Protocol) error {
 	rules := make([][]string, 0)
-	for _, ip := range result.IPs {
-		if protoForIP(ip.Address) == proto {
+	for _, route := range result.Routes {
+		if protoForIP(route.Dst) == proto {
 			rules = append(rules, getRules(result.Interfaces, route)...)
 		}
 	}
 
 	if len(rules) > 0 {
-		cleanupRules(ipt, kindPostRoutingChainName, rules)
+		cleanupRules(ipt, noSNATPostRoutingChainName, rules)
 	}
 
 	return nil
@@ -98,8 +129,8 @@ func (ib *iptablesBackend) delRules(conf *FirewallNetConf, result *current.Resul
 
 func (ib *iptablesBackend) checkRules(conf *FirewallNetConf, result *current.Result, ipt *iptables.IPTables, proto iptables.Protocol) error {
 	rules := make([][]string, 0)
-	for _, ip := range result.IPs {
-		if protoForIP(ip.Address) == proto {
+	for _, route := range result.Routes {
+		if protoForIP(route.Dst) == proto {
 			rules = append(rules, getRules(result.Interfaces, route)...)
 		}
 	}
@@ -108,30 +139,20 @@ func (ib *iptablesBackend) checkRules(conf *FirewallNetConf, result *current.Res
 		return nil
 	}
 
-	// Ensure our filter rule exists in the POSTROUTING chain
-	privRule := generateFilterRule(kindPostRoutingChainName)
-	privExists, err := ipt.Exists("nat", "POSTROUTING", privRule...)
+	// Ensure our jump rule exists in the POSTROUTING chain
+	jumpRule := generateJumpRule(noSNATPostRoutingChainName)
+	jumpExists, err := ipt.Exists("nat", "POSTROUTING", jumpRule...)
 	if err != nil {
 		return err
 	}
-	if !privExists {
-		return fmt.Errorf("expected %v rule %v not found", "POSTROUTING", privRule)
-	}
-
-	// Ensure our admin override chain rule exists in our private chain
-	adminRule := generateAdminRule(ib.adminChainName)
-	adminExists, err := ipt.Exists("nat", kindPostRoutingChainName, adminRule...)
-	if err != nil {
-		return err
-	}
-	if !adminExists {
-		return fmt.Errorf("expected %v rule %v not found", kindPostRoutingChainName, adminRule)
+	if !jumpExists {
+		return fmt.Errorf("expected %v rule %v not found", "POSTROUTING", jumpRule)
 	}
 
 	// ensure rules for this IP address exist
 	for _, rule := range rules {
 		// Ensure our rule exists in our private chain
-		exists, err := ipt.Exists("nat", kindPostRoutingChainName, rule...)
+		exists, err := ipt.Exists("nat", noSNATPostRoutingChainName, rule...)
 		if err != nil {
 			return err
 		}
